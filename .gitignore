@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
+
+# Playwright MCP
+.playwright-mcp/
+
+# Bridge data (runtime state — don't commit)
+# ~/.pi-opencode-bridge/ lives outside the repo
+
+# TypeScript build info
+*.tsbuildinfo
