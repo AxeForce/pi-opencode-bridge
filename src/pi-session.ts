@@ -52,6 +52,7 @@ export class PiSession extends EventEmitter {
   private commandCounter = 0;
   private isReady = false;
   private isStreaming = false;
+  private intentionalStop = false;
   public sessionId: string;
   public cwd: string;
   public options: PiSessionOptions;
@@ -68,8 +69,13 @@ export class PiSession extends EventEmitter {
     return this.isStreaming;
   }
 
+  get stopping(): boolean {
+    return this.intentionalStop;
+  }
+
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.intentionalStop = false;
       // Persist Pi conversation under sessionDir so restarts keep model context.
       // Use a stable session-id derived from our OpenCode session id.
       const args = ['--mode', 'rpc', '--session-id', this.sessionId];
@@ -288,6 +294,10 @@ export class PiSession extends EventEmitter {
   }
 
   kill(): void {
+    this.intentionalStop = true;
+    this.dead = true;
+    this.isReady = false;
+    this.isStreaming = false;
     this.cleanup();
   }
 

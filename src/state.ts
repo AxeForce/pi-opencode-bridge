@@ -14,6 +14,7 @@ import { mkdirSync } from 'node:fs';
 import { getProjectId } from './project.js';
 import { titleFromUserText } from './title-gen.js';
 export { titleFromUserText } from './title-gen.js';
+import { discoverPiSessions, parsePiSessionMessages } from './pi-discovery.js';
 
 export interface PendingPermission {
   tool: string;
@@ -288,6 +289,11 @@ export class ServerState {
     const stored = this.store.load(sid);
     if (stored) return this.hydrateSession(stored);
 
+    // Shadow session from Pi discovery — import on first access
+    if (sid.startsWith('ses_pi_')) {
+      return this.importShadowSession(sid);
+    }
+
     // Fallback: case-insensitive match (defensive against client mangling)
     const lower = sid.toLowerCase();
     for (const [k, v] of this.sessions) {
@@ -299,6 +305,105 @@ export class ServerState {
       }
     }
     return undefined;
+  }
+
+  /** Import a shadow Pi session into a full bridge session */
+  private importShadowSession(shadowId: string): ManagedSession | undefined {
+    const shadow = this.shadowSessions.get(shadowId);
+    if (!shadow) return undefined;
+
+    // Extract Pi session ID from shadow ID: ses_pi_<uuid>
+    const piSessionId = shadowId.replace(/^ses_pi_/, '');
+
+    // Create a proper bridge session that links to the Pi session
+    const managed = this.createSession({
+      title: shadow.title,
+      directory: shadow.directory,
+    });
+
+    // Override the ID to match the shadow ID so desktop doesn't get confused
+    // Actually — keep the new bridge ID but mark the Pi session ID for resume
+    managed.opencodeSession.title = shadow.title;
+    managed.opencodeSession.time = shadow.time;
+
+    // Store the Pi session ID so PiSession can resume it
+    (managed as any).piSessionId = piSessionId;
+
+    // Load messages from Pi JSONL
+    // We'll do this lazily — set a flag so message routes know to parse
+    (managed as any).isShadowImport = true;
+    (managed as any).piJsonlPath = undefined; // will be resolved on message fetch
+
+    // Remove from shadow map (it's now a real session)
+    this.shadowSessions.delete(shadowId);
+
+    // Update the session ID to use the Pi session ID for Pi resume
+    // Bridge keeps its own ID, but PiSession uses the Pi UUID
+    managed.piSession.sessionId = piSessionId;
+
+    this.persist(managed);
+    console.log(`[discovery] imported shadow session ${shadowId} → ${managed.id} (pi: ${piSessionId})`);
+
+    // Try to load messages from Pi JSONL
+    this.loadPiMessages(managed, piSessionId);
+
+    return managed;
+  }
+
+  /** Load messages from Pi JSONL into a managed session */
+  private async loadPiMessages(session: ManagedSession, piSessionId: string): Promise<void> {
+    try {
+      const { readFileSync } = await import('node:fs');
+      const { join: joinPath } = await import('node:path');
+      const { homedir: home } = await import('node:os');
+
+      // Try bridge pi-sessions first (flat)
+      const bridgeDir = joinPath(home(), '.pi-opencode-bridge', 'pi-sessions');
+      let jsonlPath: string | null = null;
+
+      // Check bridge dir
+      try {
+        const files = await import('node:fs/promises').then(m => m.readdir(bridgeDir));
+        for (const f of files) {
+          if (f.includes(piSessionId)) {
+            jsonlPath = joinPath(bridgeDir, f);
+            break;
+          }
+        }
+      } catch { /* */ }
+
+      // Check Pi native dir
+      if (!jsonlPath) {
+        const nativeBase = joinPath(home(), '.pi', 'agent', 'sessions');
+        try {
+          const dirs = await import('node:fs/promises').then(m => m.readdir(nativeBase));
+          for (const dir of dirs) {
+            const subdir = joinPath(nativeBase, dir);
+            try {
+              const files = await import('node:fs/promises').then(m => m.readdir(subdir));
+              for (const f of files) {
+                if (f.endsWith('.jsonl') && f.includes(piSessionId)) {
+                  jsonlPath = joinPath(subdir, f);
+                  break;
+                }
+              }
+            } catch { /* */ }
+            if (jsonlPath) break;
+          }
+        } catch { /* */ }
+      }
+
+      if (!jsonlPath) return;
+
+      const messages = await parsePiSessionMessages(jsonlPath, session.id);
+      for (const msg of messages) {
+        session.messages.set(msg.info.id, msg as any);
+      }
+      console.log(`[discovery] loaded ${messages.length} messages from Pi JSONL for ${session.id}`);
+      this.persist(session);
+    } catch (err) {
+      console.warn('[discovery] loadPiMessages error:', err);
+    }
   }
 
   deleteSession(id: string): boolean {
@@ -350,7 +455,62 @@ export class ServerState {
       byId.set(s.id, this.publicSession(sess));
     }
 
+    // Merge in shadow sessions from Pi discovery (cached)
+    for (const s of this.shadowSessions.values()) {
+      if (!matches(s)) continue;
+      byId.set(s.id, this.publicSession(s));
+    }
+
     return Array.from(byId.values()).sort((a, b) => b.time.updated - a.time.updated);
+  }
+
+  /** Shadow sessions discovered from Pi's native session files */
+  private shadowSessions = new Map<string, Session>();
+  private lastDiscoveryDir: string | undefined;
+  private lastDiscoveryTime = 0;
+  private static DISCOVERY_TTL = 10_000; // 10s cache
+
+  /** Discover Pi-native sessions and create shadow entries */
+  async discoverPiSessions(directory: string): Promise<void> {
+    // Cache: don't re-scan more than once per 10s per dir
+    if (this.lastDiscoveryDir === directory && Date.now() - this.lastDiscoveryTime < ServerState.DISCOVERY_TTL) {
+      return;
+    }
+    this.lastDiscoveryDir = directory;
+    this.lastDiscoveryTime = Date.now();
+
+    // Collect known Pi session IDs (bridge sessions store their Pi session ID)
+    const known = new Set<string>();
+    for (const s of this.store.list()) {
+      const piId = (s as any).piSessionId;
+      if (piId) known.add(piId);
+    }
+    for (const s of this.sessions.values()) {
+      known.add(s.id); // bridge sessions use the same ID for Pi
+    }
+
+    try {
+      const discovered = await discoverPiSessions(directory, known);
+      for (const piMeta of discovered) {
+        const project = getProjectId(piMeta.cwd);
+        const title = titleFromUserText(piMeta.firstUserMessage) || 'Imported Pi session';
+        const shadow: Session = {
+          id: `ses_pi_${piMeta.piSessionId}`,
+          slug: `pi-${piMeta.piSessionId.slice(-8)}`,
+          projectID: project.id,
+          directory: piMeta.cwd,
+          title,
+          version: '1.1.61',
+          time: { created: piMeta.created, updated: piMeta.updated },
+        };
+        this.shadowSessions.set(shadow.id, shadow);
+      }
+      if (discovered.length) {
+        console.log(`[discovery] found ${discovered.length} Pi sessions for ${directory}`);
+      }
+    } catch (err) {
+      console.warn('[discovery] error:', err);
+    }
   }
 
   /** Omit nullish parentID — desktop treats roots as !parentID */

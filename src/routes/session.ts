@@ -10,10 +10,16 @@ export function createSessionRoutes(state: ServerState): Hono {
   const app = new Hono();
 
   // List sessions — honor x-opencode-directory header + ?directory=
-  app.get('/', (c) => {
+  app.get('/', async (c) => {
     const header = c.req.header('x-opencode-directory') || c.req.header('X-Opencode-Directory');
     const query = c.req.query('directory') || c.req.query('dir');
     const dir = header || query ? getRequestDirectory(c) : undefined;
+
+    // Discover Pi-native sessions for this directory
+    if (dir) {
+      await state.discoverPiSessions(dir);
+    }
+
     let sessions = state.listSessions(dir);
 
     // roots=true → only top-level sessions (no parentID), like real OpenCode
