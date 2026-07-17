@@ -305,10 +305,8 @@ export function createGlobalRoutes(state: ServerState): Hono {
     const directory = c.req.query('directory') || (header ? getRequestDirectory(c) : undefined);
     const limit = parseInt(c.req.query('limit') || '100', 10);
 
-    // Discover Pi-native sessions
-    if (directory) {
-      await state.discoverPiSessions(directory);
-    }
+    // Discover Pi-native sessions, including when the client asks for all projects.
+    await state.discoverPiSessions(directory);
 
     let sessions = state.listSessions(directory);
     if (c.req.query('roots') === 'true') {

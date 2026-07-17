@@ -1,4 +1,5 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { titleFromUserText } from './title-gen.js';
@@ -12,6 +13,29 @@ export interface PiSessionMeta {
   firstAssistantMessage: string;
   messageCount: number;
   jsonlPath: string;
+}
+
+function stableID(prefix: 'msg' | 'prt', value: string): string {
+  const digest = createHash('sha256').update(value).digest('hex').slice(0, 26);
+  return `${prefix}_${digest}`;
+}
+
+function textContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((part: any) => part?.type === 'text')
+    .map((part: any) => part.text || '')
+    .join('\n');
+}
+
+function toolOutput(content: unknown): string {
+  return textContent(content);
+}
+
+function mapToolName(name: string): string {
+  const map: Record<string, string> = { find: 'glob', ls: 'list' };
+  return map[name.toLowerCase()] || name;
 }
 
 const PI_AGENT_DIR = join(homedir(), '.pi', 'agent', 'sessions');
@@ -64,22 +88,12 @@ async function readPiSessionMeta(filePath: string): Promise<PiSessionMeta | null
       if (ts) updated = Math.max(updated, ts);
       const msg = d.message || {};
       const role = msg.role;
-      const parts = Array.isArray(msg.content) ? msg.content : [];
-
-      if (role === 'user' && !firstUserMessage) {
-        firstUserMessage = parts
-          .filter((c: any) => c?.type === 'text')
-          .map((c: any) => c.text || '')
-          .join(' ')
-          .slice(0, 300);
-      }
-      if (role === 'assistant' && !firstAssistantMessage) {
-        firstAssistantMessage = parts
-          .filter((c: any) => c?.type === 'text')
-          .map((c: any) => c.text || '')
-          .join(' ')
-          .slice(0, 300);
-      }
+       if (role === 'user' && !firstUserMessage) {
+         firstUserMessage = textContent(msg.content).replace(/\s+/g, ' ').slice(0, 300);
+       }
+       if (role === 'assistant' && !firstAssistantMessage) {
+         firstAssistantMessage = textContent(msg.content).replace(/\s+/g, ' ').slice(0, 300);
+       }
     }
   }
 
@@ -149,20 +163,23 @@ async function scanFlatDir(dir: string): Promise<PiSessionMeta[]> {
  * Returns sessions that are NOT already tracked by the bridge.
  */
 export async function discoverPiSessions(
-  directory: string,
+  directory: string | undefined,
   knownPiSessionIds: Set<string>,
 ): Promise<PiSessionMeta[]> {
-  const targetDir = resolve(directory);
+  const targetDir = directory ? resolve(directory) : undefined;
   const [native, bridge] = await Promise.all([
     scanDir(PI_AGENT_DIR),
     scanFlatDir(PI_BRIDGE_DIR),
   ]);
 
-  const all = [...native, ...bridge];
-  return all
-    .filter(m => m.cwd === targetDir)
-    .filter(m => !knownPiSessionIds.has(m.piSessionId))
-    .sort((a, b) => b.updated - a.updated);
+  const unique = new Map<string, PiSessionMeta>();
+  for (const meta of [...native, ...bridge]) {
+    if (targetDir && meta.cwd !== targetDir) continue;
+    if (knownPiSessionIds.has(meta.piSessionId)) continue;
+    const previous = unique.get(meta.piSessionId);
+    if (!previous || meta.updated > previous.updated) unique.set(meta.piSessionId, meta);
+  }
+  return Array.from(unique.values()).sort((a, b) => b.updated - a.updated);
 }
 
 /**
@@ -181,9 +198,13 @@ export async function parsePiSessionMessages(
   }
 
   const messages: Array<{ info: any; parts: any[] }> = [];
+  const entryToMessageId = new Map<string, string>();
+  const toolPartsByCallId = new Map<string, any>();
   let lastUserId: string | undefined;
+  let currentProvider = 'unknown';
+  let currentModel = 'unknown';
 
-  for (const line of content.split('\n')) {
+  for (const [lineIndex, line] of content.split('\n').entries()) {
     if (!line.trim()) continue;
     let d: any;
     try {
@@ -192,20 +213,24 @@ export async function parsePiSessionMessages(
       continue;
     }
 
+    if (d.type === 'model_change') {
+      currentProvider = d.provider || currentProvider;
+      currentModel = d.modelId || currentModel;
+      continue;
+    }
     if (d.type !== 'message') continue;
     const msg = d.message || {};
     const role = msg.role;
     const ts = isoToEpoch(d.timestamp) || Date.now();
     const parts = Array.isArray(msg.content) ? msg.content : [];
+    const entryKey = String(d.id || `line-${lineIndex}`);
+    const msgId = stableID('msg', `${sessionId}:${entryKey}`);
 
     if (role === 'user') {
-      const msgId = `msg_pi_${d.id || Math.random().toString(36).slice(2)}`;
-      const textParts = parts
-        .filter((c: any) => c?.type === 'text')
-        .map((c: any) => c.text || '')
-        .join('\n');
+      const textParts = textContent(msg.content);
       if (!textParts) continue;
 
+      entryToMessageId.set(entryKey, msgId);
       lastUserId = msgId;
       messages.push({
         info: {
@@ -213,10 +238,11 @@ export async function parsePiSessionMessages(
           sessionID: sessionId,
           role: 'user',
           agent: 'build',
+          model: { providerID: currentProvider, modelID: currentModel },
           time: { created: ts },
         },
         parts: [{
-          id: `prt_pi_${d.id || Math.random().toString(36).slice(2)}`,
+          id: stableID('prt', `${sessionId}:${entryKey}:0`),
           sessionID: sessionId,
           messageID: msgId,
           type: 'text',
@@ -224,44 +250,63 @@ export async function parsePiSessionMessages(
           time: { start: ts },
         }],
       });
+    } else if (role === 'toolResult') {
+      const toolPart = toolPartsByCallId.get(msg.toolCallId);
+      if (toolPart) {
+        const output = toolOutput(msg.content);
+        toolPart.state = {
+          status: msg.isError ? 'error' : 'completed',
+          input: toolPart.state.input,
+          ...(msg.isError ? { error: output || 'Tool failed' } : {
+            output,
+            title: toolPart.tool,
+            metadata: {},
+          }),
+          time: { start: toolPart.state.time.start, end: ts },
+        };
+      }
     } else if (role === 'assistant') {
-      const msgId = `msg_pi_${d.id || Math.random().toString(36).slice(2)}`;
+      entryToMessageId.set(entryKey, msgId);
       const ocParts: any[] = [];
 
       for (const c of parts) {
         if (c?.type === 'thinking' && c.thinking) {
           ocParts.push({
-            id: `prt_pi_${d.id}_${ocParts.length}`,
+            id: stableID('prt', `${sessionId}:${entryKey}:${ocParts.length}`),
             sessionID: sessionId,
             messageID: msgId,
             type: 'reasoning',
             text: c.thinking,
-            time: { start: ts },
+            time: { start: ts, end: ts },
           });
         } else if (c?.type === 'text' && c.text) {
           ocParts.push({
-            id: `prt_pi_${d.id}_${ocParts.length}`,
+            id: stableID('prt', `${sessionId}:${entryKey}:${ocParts.length}`),
             sessionID: sessionId,
             messageID: msgId,
             type: 'text',
             text: c.text,
-            time: { start: ts },
+            time: { start: ts, end: ts },
           });
         } else if (c?.type === 'toolCall') {
+          const callID = c.id || `${entryKey}-${ocParts.length}`;
           ocParts.push({
-            id: `prt_pi_${d.id}_${ocParts.length}`,
+            id: stableID('prt', `${sessionId}:${entryKey}:${ocParts.length}`),
             sessionID: sessionId,
             messageID: msgId,
             type: 'tool',
-            tool: c.name || 'unknown',
-            callID: c.id || '',
+            tool: mapToolName(c.name || 'unknown'),
+            callID,
             state: {
               status: 'completed',
               input: c.arguments || {},
               output: '',
+              title: mapToolName(c.name || 'unknown'),
+              metadata: {},
               time: { start: ts, end: ts },
             },
           });
+          toolPartsByCallId.set(callID, ocParts[ocParts.length - 1]);
         }
       }
 
@@ -274,9 +319,9 @@ export async function parsePiSessionMessages(
           sessionID: sessionId,
           role: 'assistant',
           agent: 'build',
-          parentID: lastUserId,
-          modelID: msg.model || undefined,
-          providerID: msg.provider || undefined,
+           parentID: entryToMessageId.get(String(d.parentId || '')) || lastUserId || msgId,
+           modelID: msg.model || currentModel,
+           providerID: msg.provider || currentProvider,
           mode: 'build',
           time: { created: ts, completed: ts },
           tokens: {
@@ -285,7 +330,8 @@ export async function parsePiSessionMessages(
             reasoning: usage.reasoning || 0,
             cache: { read: usage.cacheRead || 0, write: usage.cacheWrite || 0 },
           },
-          cost: usage.cost?.total || 0,
+           cost: usage.cost?.total || 0,
+           ...(msg.stopReason ? { finish: msg.stopReason === 'toolUse' ? 'tool-calls' : msg.stopReason } : {}),
         },
         parts: ocParts,
       });

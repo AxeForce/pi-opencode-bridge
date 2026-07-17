@@ -15,10 +15,8 @@ export function createSessionRoutes(state: ServerState): Hono {
     const query = c.req.query('directory') || c.req.query('dir');
     const dir = header || query ? getRequestDirectory(c) : undefined;
 
-    // Discover Pi-native sessions for this directory
-    if (dir) {
-      await state.discoverPiSessions(dir);
-    }
+    // Discover Pi-native sessions for this directory or all projects.
+    await state.discoverPiSessions(dir);
 
     let sessions = state.listSessions(dir);
 
