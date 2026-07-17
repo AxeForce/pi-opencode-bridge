@@ -118,6 +118,7 @@ async function handleStreamingPrompt(
   };
 
   session.messages.set(userMsgId, userMessage);
+  session.opencodeSession.time.updated = now;
   state.persist(session);
   state.broadcast({ type: 'message.updated', properties: { info: userMessage.info } as any });
   state.broadcast({ type: 'message.part.updated', properties: { part: userMessage.parts[0] } as any });
@@ -226,6 +227,7 @@ async function handlePrompt(
     };
     session.messages.set(userMsgId, userMessage);
     session.status = { type: 'busy' };
+    session.opencodeSession.time.updated = now;
     state.persist(session);
 
     // Emit the same event sequence as real OpenCode

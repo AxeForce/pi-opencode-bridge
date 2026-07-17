@@ -565,6 +565,7 @@ export class StreamAdapter {
       properties: { sessionID: this.session.id },
     };
     this.state.broadcast(idleEvent);
+    this.session.opencodeSession.time.updated = Date.now();
     this.state.broadcast({
       type: 'session.updated',
       properties: { info: this.session.opencodeSession } as any,

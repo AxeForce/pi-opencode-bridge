@@ -620,7 +620,7 @@ export class ServerState {
   }
 
   persist(session: ManagedSession): void {
-    session.opencodeSession.time.updated = Date.now();
+    // Persisting internal state must not reorder the session list.
     this.store.save({
       opencodeSession: session.opencodeSession,
       messages: Array.from(session.messages.values()),
