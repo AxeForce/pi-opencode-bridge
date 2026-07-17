@@ -4,6 +4,23 @@ import { StreamAdapter } from '../stream-adapter.js';
 import { getDefaultModelRef } from '../pi-models.js';
 import { getAgent } from '../pi-agents.js';
 import { newMessageID, newPartID } from '../id.js';
+import type { AnyMessageWithParts } from '../types/messages.js';
+
+type PromptResult =
+  | { ok: true; message?: AnyMessageWithParts }
+  | { ok: false; status: number; error: string };
+
+function latestAssistantMessage(state: ServerState, sessionId: string): AnyMessageWithParts | undefined {
+  const session = state.getSession(sessionId);
+  if (!session) return undefined;
+
+  if (session.currentMessageId) {
+    const current = session.messages.get(session.currentMessageId);
+    if (current?.info.role === 'assistant') return current;
+  }
+
+  return state.getMessages(sessionId).reverse().find(message => message.info.role === 'assistant');
+}
 
 async function ensureAdapter(state: ServerState, sessionId: string): Promise<StreamAdapter | null> {
   const session = state.getSession(sessionId);
@@ -24,7 +41,7 @@ async function ensureAdapter(state: ServerState, sessionId: string): Promise<Str
   const model = session.model || getDefaultModelRef();
   const { PiSession } = await import('../pi-session.js');
   session.piSession = new PiSession(
-    session.id,
+    session.piSessionId || session.id,
     session.workingDir,
     state.piOptionsFor(session.agent || 'build', model),
   );
@@ -58,14 +75,94 @@ function extractText(parts: PromptBody['parts']): string {
     .join('\n');
 }
 
+async function handleStreamingPrompt(
+  state: ServerState,
+  sessionId: string,
+  session: NonNullable<ReturnType<ServerState['getSession']>>,
+  adapter: StreamAdapter,
+  body: PromptBody,
+  mode: 'sync' | 'async',
+): Promise<PromptResult> {
+  const userText = extractText(body.parts);
+  if (!userText) return { ok: false as const, status: 400, error: 'No text in message' };
+
+  const steerMatch = /^\/steer(?:\s+([\s\S]*))?$/i.exec(userText.trim());
+  if (steerMatch && !steerMatch[1]?.trim()) {
+    return { ok: false as const, status: 400, error: 'Steer message is empty' };
+  }
+  const isSteer = Boolean(steerMatch);
+  const actualText = steerMatch ? steerMatch[1].trim() : userText;
+  const generation = adapter.generation;
+  const agentName = body.agent || session.agent || 'build';
+  const model = body.model || session.model || getDefaultModelRef();
+  const userMsgId = body.messageID?.startsWith('msg_') ? body.messageID : newMessageID();
+  const partId = newPartID();
+  const now = Date.now();
+  const userMessage = {
+    info: {
+      id: userMsgId,
+      sessionID: sessionId,
+      agent: agentName,
+      role: 'user' as const,
+      time: { created: now },
+      model: { providerID: model.providerID, modelID: model.modelID },
+    },
+    parts: [{
+      id: partId,
+      sessionID: sessionId,
+      messageID: userMsgId,
+      type: 'text' as const,
+      text: actualText,
+      time: { start: now },
+    }],
+  };
+
+  session.messages.set(userMsgId, userMessage);
+  state.persist(session);
+  state.broadcast({ type: 'message.updated', properties: { info: userMessage.info } as any });
+  state.broadcast({ type: 'message.part.updated', properties: { part: userMessage.parts[0] } as any });
+
+  try {
+    if (isSteer) {
+      await adapter.sendSteer(actualText);
+      if (mode === 'sync') await adapter.waitForIdle(generation - 1);
+      await adapter.sendFollowUp(actualText);
+      if (mode === 'sync') await adapter.waitForIdle(generation - 1);
+
+    if (mode === 'sync') {
+      const message = latestAssistantMessage(state, sessionId);
+      if (!message) throw new Error('Pi produced no assistant message');
+      return { ok: true as const, message };
+    }
+  } catch (err: any) {
+    console.error(`[message] ${isSteer ? 'steer' : 'followUp'} error:`, err);
+    if (mode === 'sync') return { ok: false as const, status: 500, error: String(err) };
+  }
+
+  return { ok: true as const };
+}
+
 async function handlePrompt(
   state: ServerState,
   sessionId: string,
   body: PromptBody,
   mode: 'sync' | 'async',
-): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
-  // Serialize prompts per session — prevents concurrent adapter races
-  return state.promptQueue.run(sessionId, async () => {
+): Promise<PromptResult> {
+
+  const session = state.getSession(sessionId);
+  if (!session) {
+    console.error(`[message] session not found: ${sessionId}`);
+    return { ok: false as const, status: 404, error: 'Session not found' };
+  }
+
+  const activeAdapter = session.adapter as StreamAdapter | undefined;
+  if (activeAdapter && !session.piSession.dead && activeAdapter.isStreaming) {
+    return handleStreamingPrompt(state, sessionId, session, activeAdapter, body, mode);
+  }
+
+  // Every prompt uses the queue. The task stays queued until Pi emits agent_end,
+  // so concurrent requests cannot become implicit follow-ups.
+  const task = state.promptQueue.run(sessionId, async () => {
     const session = state.getSession(sessionId);
     if (!session) {
       console.error(`[message] session not found: ${sessionId}`);
@@ -102,7 +199,7 @@ async function handlePrompt(
     }
 
     // Use client-supplied messageID if valid, else generate
-    const userMsgId = (body.messageID && body.messageID.startsWith('msg'))
+    const userMsgId = (body.messageID && body.messageID.startsWith('msg_'))
       ? body.messageID
       : newMessageID();
     const partId = newPartID();
@@ -151,7 +248,18 @@ async function handlePrompt(
     console.log(`[message] ${mode} prompt session=${sessionId} dir=${session.workingDir} model=${model.providerID}/${model.modelID} text=${text.slice(0, 80)}`);
 
     try {
+      const generation = adapter.generation;
       await adapter.sendPrompt(text);
+      // Keep the queue occupied for the entire agent run, not just until the
+      // RPC acceptance response arrives.
+      await adapter.waitForIdle(generation);
+      if (mode === 'sync') {
+        const message = latestAssistantMessage(state, sessionId);
+        if (!message) {
+          throw new Error('Pi produced no assistant message');
+        }
+        return { ok: true as const, message };
+      }
     } catch (err: any) {
       console.error('[message] send to pi error:', err);
       session.status = { type: 'idle' };
@@ -182,10 +290,28 @@ async function handlePrompt(
         properties: { sessionID: sessionId },
       });
       state.persist(session);
+      if (mode === 'sync') {
+        return { ok: false as const, status: 500, error: String(err) };
+      }
     }
 
     return { ok: true as const };
   });
+
+  if (mode === 'async') {
+    void task
+      .then(result => {
+        if (!result.ok) {
+          console.error(`[message] async prompt failed session=${sessionId}: ${result.error}`);
+        }
+      })
+      .catch(err => {
+        console.error(`[message] async prompt crashed session=${sessionId}:`, err);
+      });
+    return { ok: true as const };
+  }
+
+  return task;
 }
 
 export function createMessageRoutes(state: ServerState): Hono {
@@ -239,13 +365,14 @@ export function createMessageRoutes(state: ServerState): Hono {
     return c.json(msg);
   });
 
-  // Send message (sync) — real OpenCode returns empty body
+  // Send message (sync) — wait for the completed assistant message
   app.post('/:id/message', async (c) => {
     const sessionId = c.req.param('id');
     const body = await c.req.json().catch(() => ({})) as PromptBody;
     const result = await handlePrompt(state, sessionId, body, 'sync');
     if (!result.ok) return c.json({ error: result.error }, result.status as any);
-    return c.body(null, 200);
+    if (!result.message) return c.json({ error: 'No assistant message' }, 500);
+    return c.json(result.message, 200);
   });
 
   // Send message async — desktop uses this

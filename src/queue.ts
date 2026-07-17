@@ -7,21 +7,16 @@ export class AsyncQueue {
 
   async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.chains.get(key) || Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-    const next = prev.then(() => gate);
-    this.chains.set(key, next.catch(() => {}));
+    const task = prev.then(fn, fn);
+    const tail = task.catch(() => {});
+    this.chains.set(key, tail);
 
-    await prev.catch(() => {});
-    try {
-      return await fn();
-    } finally {
-      release();
-      // Prune if we're still the tail
-      if (this.chains.get(key) === next) {
-        this.chains.delete(key);
-      }
-    }
+    // Remove the key only when this task is still the queue tail.
+    void tail.then(() => {
+      if (this.chains.get(key) === tail) this.chains.delete(key);
+    });
+
+    return task;
   }
 
   isBusy(key: string): boolean {

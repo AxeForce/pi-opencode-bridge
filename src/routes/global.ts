@@ -297,13 +297,17 @@ export function createGlobalRoutes(state: ServerState): Hono {
 
   // Desktop probes these; return empty JSON not 404
   app.get('/api/reference', (c) => c.json({}));
-  app.get('/api/session', (c) => {
+  app.get('/api/session', async (c) => {
     // Desktop home uses v2.session.list → GET /api/session with cursor pagination:
     //   { data: SessionV2[], cursor: { next?: string } }
     // V2 sessions use location.directory (see toLegacySummary in desktop).
     const header = c.req.header('x-opencode-directory');
     const directory = c.req.query('directory') || (header ? getRequestDirectory(c) : undefined);
     const limit = parseInt(c.req.query('limit') || '100', 10);
+
+    // Discover Pi-native sessions, including when the client asks for all projects.
+    await state.discoverPiSessions(directory);
+
     let sessions = state.listSessions(directory);
     if (c.req.query('roots') === 'true') {
       sessions = sessions.filter(s => !s.parentID);

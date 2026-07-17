@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 type IDPrefix = 'ses' | 'msg' | 'prt' | 'pty' | 'cal' | 'usr' | 'per';
 
@@ -27,6 +27,12 @@ export const newPtyID = () => generateID('pty');
 export const newCallID = () => generateID('cal');
 export const newUserID = () => generateID('usr');
 export const newPermissionID = () => generateID('per');
+
+/** Stable, protocol-safe ID for a session imported from a Pi JSONL file. */
+export function importedSessionID(piSessionId: string): string {
+  const digest = createHash('sha256').update(piSessionId).digest('hex').slice(0, 26);
+  return `ses_${digest}`;
+}
 
 export function isValidID(id: string, prefix?: IDPrefix): boolean {
   if (!id || typeof id !== 'string') return false;

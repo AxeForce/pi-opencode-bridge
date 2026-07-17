@@ -10,6 +10,9 @@ export interface PersistedSession {
   todos: Array<{ content: string; status: string; priority: string }>;
   agent: string;
   model: { providerID: string; modelID: string };
+  piSessionId?: string;
+  titleLocked?: boolean;
+  llmTitleDone?: boolean;
 }
 
 export class SessionStore {

@@ -3,17 +3,18 @@ import type { AnyMessageWithParts } from './types/messages.js';
 import type { Part } from './types/parts.js';
 import type { OpenCodeEvent } from './types/events.js';
 import { PiSession } from './pi-session.js';
-import { newSessionID, newMessageID, newPartID } from './id.js';
+import { newSessionID, newMessageID, newPartID, importedSessionID } from './id.js';
 import { SessionStore, type PersistedSession } from './storage.js';
 import { getDefaultModelRef } from './pi-models.js';
 import { getAgent } from './pi-agents.js';
 import { AsyncQueue } from './queue.js';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { getProjectId } from './project.js';
 import { titleFromUserText } from './title-gen.js';
 export { titleFromUserText } from './title-gen.js';
+import { discoverPiSessions, parsePiSessionMessages } from './pi-discovery.js';
 
 export interface PendingPermission {
   tool: string;
@@ -43,6 +44,7 @@ export interface ManagedSession {
   workingDir: string;
   agent: string;
   model: { providerID: string; modelID: string };
+  piSessionId?: string;
   adapter?: any;
   /** Once set (user rename or auto-title), don't overwrite */
   titleLocked?: boolean;
@@ -110,13 +112,15 @@ export class ServerState {
   }
 
   createSession(opts: {
+    id?: string;
+    piSessionId?: string;
     title?: string;
     parentID?: string;
     projectID?: string;
     directory?: string;
     agent?: string;
   } = {}): ManagedSession {
-    const id = newSessionID();
+    const id = opts.id || newSessionID();
     const now = Date.now();
     const directory = opts.directory || this.workingDir;
     const agent = opts.agent || 'build';
@@ -136,7 +140,8 @@ export class ServerState {
       ...(opts.parentID ? { parentID: opts.parentID } : {}),
     };
 
-    const piSession = new PiSession(id, directory, this.piOptionsFor(agent, model));
+    const piSessionId = opts.piSessionId || id;
+    const piSession = new PiSession(piSessionId, directory, this.piOptionsFor(agent, model));
     const managed: ManagedSession = {
       id,
       opencodeSession,
@@ -151,6 +156,7 @@ export class ServerState {
       workingDir: directory,
       agent,
       model,
+      ...(opts.piSessionId ? { piSessionId } : {}),
       // Only lock if caller gave a real custom title (not the default placeholder)
       titleLocked: Boolean(
         opts.title &&
@@ -204,8 +210,9 @@ export class ServerState {
     const agent = data.agent || 'build';
     const model = data.model || getDefaultModelRef();
     // Same session-id + session-dir → Pi resumes prior conversation context
+    const piSessionId = data.piSessionId || data.opencodeSession.id;
     const piSession = new PiSession(
-      data.opencodeSession.id,
+      piSessionId,
       data.opencodeSession.directory,
       this.piOptionsFor(agent, model),
     );
@@ -215,7 +222,8 @@ export class ServerState {
     }
 
     const title = (data.opencodeSession.title || '').trim();
-    const titleLocked = Boolean(title && !/^new session\b/i.test(title) && title !== 'New Session');
+    const inferredTitleLocked = Boolean(title && !/^new session\b/i.test(title) && title !== 'New Session');
+    const titleLocked = data.titleLocked ?? inferredTitleLocked;
 
     const managed: ManagedSession = {
       id: data.opencodeSession.id,
@@ -231,8 +239,9 @@ export class ServerState {
       workingDir: data.opencodeSession.directory,
       agent,
       model,
+      ...(data.piSessionId ? { piSessionId } : {}),
       titleLocked,
-      llmTitleDone: titleLocked,
+      llmTitleDone: data.llmTitleDone ?? titleLocked,
       touchedFiles: new Set<string>(),
     };
 
@@ -287,6 +296,11 @@ export class ServerState {
     const stored = this.store.load(sid);
     if (stored) return this.hydrateSession(stored);
 
+    // Shadow session from Pi discovery — import on first access
+    if (this.shadowPiSessionIds.has(sid)) {
+      return this.importShadowSession(sid);
+    }
+
     // Fallback: case-insensitive match (defensive against client mangling)
     const lower = sid.toLowerCase();
     for (const [k, v] of this.sessions) {
@@ -298,6 +312,106 @@ export class ServerState {
       }
     }
     return undefined;
+  }
+
+  /** Import a shadow Pi session into a full bridge session */
+  private importShadowSession(shadowId: string): ManagedSession | undefined {
+    const shadow = this.shadowSessions.get(shadowId);
+    const piSessionId = this.shadowPiSessionIds.get(shadowId);
+    if (!shadow || !piSessionId) return undefined;
+
+    // Create a proper bridge session that links to the Pi session
+    const managed = this.createSession({
+      id: shadowId,
+      piSessionId,
+      title: 'New session',
+      directory: shadow.directory,
+    });
+
+    // Override the ID to match the shadow ID so desktop doesn't get confused
+    // Actually — keep the new bridge ID but mark the Pi session ID for resume
+    managed.opencodeSession.title = shadow.title;
+    managed.opencodeSession.time = shadow.time;
+
+    // Imported titles are heuristics; allow the next completed prompt to refine them.
+    managed.titleLocked = false;
+    managed.llmTitleDone = false;
+
+    // Remove from shadow map (it's now a real session)
+    this.shadowSessions.delete(shadowId);
+    this.shadowPiSessionIds.delete(shadowId);
+
+    // Update the session ID to use the Pi session ID for Pi resume
+    // Bridge keeps its own ID, but PiSession uses the Pi UUID
+    managed.piSession.sessionId = piSessionId;
+
+    const messages = this.shadowMessages.get(shadowId) || [];
+    this.shadowMessages.delete(shadowId);
+    for (const msg of messages) {
+      managed.messages.set(msg.info.id, msg as any);
+      if (msg.info.role === 'assistant') managed.currentMessageId = msg.info.id;
+    }
+
+    this.persist(managed);
+    console.log(`[discovery] imported shadow session ${shadowId} → ${managed.id} (pi: ${piSessionId})`);
+
+    return managed;
+  }
+
+  /** Load messages from Pi JSONL into a managed session */
+  private async loadPiMessages(session: ManagedSession, piSessionId: string): Promise<void> {
+    try {
+      const { readFileSync } = await import('node:fs');
+      const { join: joinPath } = await import('node:path');
+      const { homedir: home } = await import('node:os');
+
+      // Try bridge pi-sessions first (flat)
+      const bridgeDir = joinPath(home(), '.pi-opencode-bridge', 'pi-sessions');
+      let jsonlPath: string | null = null;
+
+      // Check bridge dir
+      try {
+        const files = await import('node:fs/promises').then(m => m.readdir(bridgeDir));
+        for (const f of files) {
+          if (f.includes(piSessionId)) {
+            jsonlPath = joinPath(bridgeDir, f);
+            break;
+          }
+        }
+      } catch { /* */ }
+
+      // Check Pi native dir
+      if (!jsonlPath) {
+        const nativeBase = joinPath(home(), '.pi', 'agent', 'sessions');
+        try {
+          const dirs = await import('node:fs/promises').then(m => m.readdir(nativeBase));
+          for (const dir of dirs) {
+            const subdir = joinPath(nativeBase, dir);
+            try {
+              const files = await import('node:fs/promises').then(m => m.readdir(subdir));
+              for (const f of files) {
+                if (f.endsWith('.jsonl') && f.includes(piSessionId)) {
+                  jsonlPath = joinPath(subdir, f);
+                  break;
+                }
+              }
+            } catch { /* */ }
+            if (jsonlPath) break;
+          }
+        } catch { /* */ }
+      }
+
+      if (!jsonlPath) return;
+
+      const messages = await parsePiSessionMessages(jsonlPath, session.id);
+      for (const msg of messages) {
+        session.messages.set(msg.info.id, msg as any);
+      }
+      console.log(`[discovery] loaded ${messages.length} messages from Pi JSONL for ${session.id}`);
+      this.persist(session);
+    } catch (err) {
+      console.warn('[discovery] loadPiMessages error:', err);
+    }
   }
 
   deleteSession(id: string): boolean {
@@ -349,7 +463,71 @@ export class ServerState {
       byId.set(s.id, this.publicSession(sess));
     }
 
+    // Merge in shadow sessions from Pi discovery (cached)
+    for (const s of this.shadowSessions.values()) {
+      if (!matches(s)) continue;
+      byId.set(s.id, this.publicSession(s));
+    }
+
     return Array.from(byId.values()).sort((a, b) => b.time.updated - a.time.updated);
+  }
+
+  /** Shadow sessions discovered from Pi's native session files */
+  private shadowSessions = new Map<string, Session>();
+  private shadowPiSessionIds = new Map<string, string>();
+  private shadowMessages = new Map<string, Array<{ info: any; parts: any[] }>>();
+  private lastDiscoveryDir: string | undefined;
+  private lastDiscoveryTime = 0;
+  private static DISCOVERY_TTL = 10_000; // 10s cache
+
+  /** Discover Pi-native sessions and create shadow entries */
+  async discoverPiSessions(directory?: string): Promise<void> {
+    const targetDirectory = directory ? resolve(directory) : undefined;
+    // Cache: don't re-scan more than once per 10s per dir
+    if (this.lastDiscoveryDir === (targetDirectory || '*') && Date.now() - this.lastDiscoveryTime < ServerState.DISCOVERY_TTL) {
+      return;
+    }
+    this.lastDiscoveryDir = targetDirectory || '*';
+    this.lastDiscoveryTime = Date.now();
+
+    // Collect known Pi session IDs (bridge sessions store their Pi session ID)
+    const known = new Set<string>();
+    for (const s of this.store.list()) {
+      const piId = s.piSessionId;
+      if (piId) known.add(piId);
+    }
+    for (const s of this.sessions.values()) {
+      known.add(s.piSessionId || s.id);
+    }
+
+    try {
+      const discovered = await discoverPiSessions(targetDirectory, known);
+      for (const piMeta of discovered) {
+        const project = getProjectId(piMeta.cwd);
+        const title = titleFromUserText(piMeta.firstUserMessage) || 'Imported Pi session';
+        const shadowId = importedSessionID(piMeta.piSessionId);
+        const shadow: Session = {
+          id: shadowId,
+          slug: `pi-${piMeta.piSessionId.slice(-8)}`,
+          projectID: project.id,
+          directory: piMeta.cwd,
+          title,
+          version: '1.1.61',
+          time: { created: piMeta.created, updated: piMeta.updated },
+        };
+        this.shadowSessions.set(shadow.id, shadow);
+        this.shadowPiSessionIds.set(shadow.id, piMeta.piSessionId);
+        this.shadowMessages.set(
+          shadow.id,
+          await parsePiSessionMessages(piMeta.jsonlPath, shadow.id),
+        );
+      }
+      if (discovered.length) {
+        console.log(`[discovery] found ${discovered.length} Pi sessions for ${targetDirectory || '(all projects)'}`);
+      }
+    } catch (err) {
+      console.warn('[discovery] error:', err);
+    }
   }
 
   /** Omit nullish parentID — desktop treats roots as !parentID */
@@ -437,6 +615,9 @@ export class ServerState {
       todos: session.todos,
       agent: session.agent,
       model: session.model,
+      ...(session.piSessionId ? { piSessionId: session.piSessionId } : {}),
+      titleLocked: session.titleLocked,
+      llmTitleDone: session.llmTitleDone,
     });
   }
 
