@@ -48,6 +48,7 @@ try {
 }
 
 const state = new ServerState(WORKING_DIR);
+void state.discoverPiSessions();
 
 const app = new Hono();
 

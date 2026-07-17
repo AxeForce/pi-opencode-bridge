@@ -4,19 +4,19 @@ import { StreamAdapter } from '../stream-adapter.js';
 import { getDefaultModelRef } from '../pi-models.js';
 import { getRequestDirectory } from '../directory.js';
 import { getDiffsForFiles, summarizeDiffs } from '../git.js';
-import { generateSessionTitle } from '../title-gen.js';
+import { generateSessionTitle, titleFromUserText } from '../title-gen.js';
 
 export function createSessionRoutes(state: ServerState): Hono {
   const app = new Hono();
 
   // List sessions — honor x-opencode-directory header + ?directory=
-  app.get('/', async (c) => {
+  app.get('/', (c) => {
     const header = c.req.header('x-opencode-directory') || c.req.header('X-Opencode-Directory');
     const query = c.req.query('directory') || c.req.query('dir');
     const dir = header || query ? getRequestDirectory(c) : undefined;
 
     // Discover Pi-native sessions for this directory or all projects.
-    await state.discoverPiSessions(dir);
+    void state.discoverPiSessions(dir);
 
     let sessions = state.listSessions(dir);
 
@@ -304,11 +304,11 @@ export function createSessionRoutes(state: ServerState): Hono {
     // Force regenerate even if previously titled
     session.llmTitleDone = false;
     session.titleLocked = false;
-    const title = await generateSessionTitle({
+    const generatedTitle = await generateSessionTitle({
       userText,
       assistantText,
-      model: session.model,
     });
+    const title = generatedTitle || titleFromUserText(userText) || 'Conversation';
     session.opencodeSession.title = title;
     session.opencodeSession.time.updated = Date.now();
     session.llmTitleDone = true;

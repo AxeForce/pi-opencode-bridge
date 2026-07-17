@@ -320,8 +320,10 @@ export async function parsePiSessionMessages(
           role: 'assistant',
           agent: 'build',
            parentID: entryToMessageId.get(String(d.parentId || '')) || lastUserId || msgId,
-           modelID: msg.model || currentModel,
-           providerID: msg.provider || currentProvider,
+           model: {
+             providerID: msg.provider || currentProvider,
+             modelID: msg.model || currentModel,
+           },
           mode: 'build',
           time: { created: ts, completed: ts },
           tokens: {

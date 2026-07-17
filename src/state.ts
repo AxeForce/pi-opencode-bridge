@@ -8,7 +8,7 @@ import { SessionStore, type PersistedSession } from './storage.js';
 import { getDefaultModelRef } from './pi-models.js';
 import { getAgent } from './pi-agents.js';
 import { AsyncQueue } from './queue.js';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { getProjectId } from './project.js';
@@ -50,6 +50,7 @@ export interface ManagedSession {
   titleLocked?: boolean;
   /** Heuristic title applied; LLM title may still upgrade once */
   llmTitleDone?: boolean;
+  llmTitleGenerating?: boolean;
   /** Files touched by edit/write tools this session (for /diff) */
   touchedFiles?: Set<string>;
 }
@@ -224,6 +225,12 @@ export class ServerState {
     const title = (data.opencodeSession.title || '').trim();
     const inferredTitleLocked = Boolean(title && !/^new session\b/i.test(title) && title !== 'New Session');
     const titleLocked = data.titleLocked ?? inferredTitleLocked;
+    const firstUserText = (data.messages || [])
+      .find(msg => msg.info.role === 'user')?.parts
+      ?.filter((part: any) => part.type === 'text')
+      .map((part: any) => part.text || '')
+      .join('\n') || '';
+    const isPersistedHeuristicTitle = !titleLocked && title === titleFromUserText(firstUserText);
 
     const managed: ManagedSession = {
       id: data.opencodeSession.id,
@@ -241,7 +248,7 @@ export class ServerState {
       model,
       ...(data.piSessionId ? { piSessionId } : {}),
       titleLocked,
-      llmTitleDone: data.llmTitleDone ?? titleLocked,
+      llmTitleDone: isPersistedHeuristicTitle ? false : (data.llmTitleDone ?? titleLocked),
       touchedFiles: new Set<string>(),
     };
 
@@ -262,17 +269,18 @@ export class ServerState {
 
   async applyLlmTitle(sessionId: string, userText: string, assistantText?: string): Promise<void> {
     const session = this.getSession(sessionId);
-    if (!session || session.llmTitleDone) return;
+    if (!session || session.llmTitleDone || session.llmTitleGenerating) return;
     if (session.titleLocked) return;
-    session.llmTitleDone = true;
+    session.llmTitleGenerating = true;
     try {
       const { generateSessionTitle } = await import('./title-gen.js');
       const title = await generateSessionTitle({
         userText,
         assistantText,
-        model: session.model,
       });
       if (!title) return;
+      session.llmTitleDone = true;
+      session.titleLocked = true;
       session.opencodeSession.title = title;
       session.opencodeSession.time.updated = Date.now();
       this.persist(session);
@@ -283,6 +291,8 @@ export class ServerState {
       console.log(`[state] llm title session=${sessionId} → ${title}`);
     } catch (err) {
       console.warn('[state] llm title failed:', err);
+    } finally {
+      session.llmTitleGenerating = false;
     }
   }
 
@@ -476,58 +486,60 @@ export class ServerState {
   private shadowSessions = new Map<string, Session>();
   private shadowPiSessionIds = new Map<string, string>();
   private shadowMessages = new Map<string, Array<{ info: any; parts: any[] }>>();
-  private lastDiscoveryDir: string | undefined;
   private lastDiscoveryTime = 0;
+  private discoveryInFlight: Promise<void> | null = null;
   private static DISCOVERY_TTL = 10_000; // 10s cache
 
   /** Discover Pi-native sessions and create shadow entries */
-  async discoverPiSessions(directory?: string): Promise<void> {
-    const targetDirectory = directory ? resolve(directory) : undefined;
-    // Cache: don't re-scan more than once per 10s per dir
-    if (this.lastDiscoveryDir === (targetDirectory || '*') && Date.now() - this.lastDiscoveryTime < ServerState.DISCOVERY_TTL) {
-      return;
-    }
-    this.lastDiscoveryDir = targetDirectory || '*';
+  async discoverPiSessions(_directory?: string): Promise<void> {
+    if (this.discoveryInFlight) return this.discoveryInFlight;
+    if (Date.now() - this.lastDiscoveryTime < ServerState.DISCOVERY_TTL) return;
+
     this.lastDiscoveryTime = Date.now();
-
-    // Collect known Pi session IDs (bridge sessions store their Pi session ID)
-    const known = new Set<string>();
-    for (const s of this.store.list()) {
-      const piId = s.piSessionId;
-      if (piId) known.add(piId);
-    }
-    for (const s of this.sessions.values()) {
-      known.add(s.piSessionId || s.id);
-    }
-
-    try {
-      const discovered = await discoverPiSessions(targetDirectory, known);
-      for (const piMeta of discovered) {
-        const project = getProjectId(piMeta.cwd);
-        const title = titleFromUserText(piMeta.firstUserMessage) || 'Imported Pi session';
-        const shadowId = importedSessionID(piMeta.piSessionId);
-        const shadow: Session = {
-          id: shadowId,
-          slug: `pi-${piMeta.piSessionId.slice(-8)}`,
-          projectID: project.id,
-          directory: piMeta.cwd,
-          title,
-          version: '1.1.61',
-          time: { created: piMeta.created, updated: piMeta.updated },
-        };
-        this.shadowSessions.set(shadow.id, shadow);
-        this.shadowPiSessionIds.set(shadow.id, piMeta.piSessionId);
-        this.shadowMessages.set(
-          shadow.id,
-          await parsePiSessionMessages(piMeta.jsonlPath, shadow.id),
-        );
+    this.discoveryInFlight = (async () => {
+      // Collect known Pi session IDs (bridge sessions store their Pi session ID)
+      const known = new Set<string>();
+      for (const s of this.store.list()) {
+        const piId = s.piSessionId;
+        if (piId) known.add(piId);
       }
-      if (discovered.length) {
-        console.log(`[discovery] found ${discovered.length} Pi sessions for ${targetDirectory || '(all projects)'}`);
+      for (const s of this.sessions.values()) {
+        known.add(s.piSessionId || s.id);
       }
-    } catch (err) {
-      console.warn('[discovery] error:', err);
-    }
+
+      try {
+        const discovered = await discoverPiSessions(undefined, known);
+        for (const piMeta of discovered) {
+          const project = getProjectId(piMeta.cwd);
+          const title = titleFromUserText(piMeta.firstUserMessage) || 'Imported Pi session';
+          const shadowId = importedSessionID(piMeta.piSessionId);
+          const shadow: Session = {
+            id: shadowId,
+            slug: `pi-${piMeta.piSessionId.slice(-8)}`,
+            projectID: project.id,
+            directory: piMeta.cwd,
+            title,
+            version: '1.1.61',
+            time: { created: piMeta.created, updated: piMeta.updated },
+          };
+          this.shadowSessions.set(shadow.id, shadow);
+          this.shadowPiSessionIds.set(shadow.id, piMeta.piSessionId);
+          this.shadowMessages.set(
+            shadow.id,
+            await parsePiSessionMessages(piMeta.jsonlPath, shadow.id),
+          );
+        }
+        if (discovered.length) {
+          console.log(`[discovery] found ${discovered.length} Pi sessions`);
+        }
+      } catch (err) {
+        console.warn('[discovery] error:', err);
+      }
+    })().finally(() => {
+      this.discoveryInFlight = null;
+    });
+
+    return this.discoveryInFlight;
   }
 
   /** Omit nullish parentID — desktop treats roots as !parentID */

@@ -1,4 +1,10 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+export const TITLE_GENERATION_MODEL = {
+  providerID: 'opencode-go',
+  modelID: 'deepseek-v4-flash',
+} as const;
 
 /** Short human title from first user prompt (no extra LLM call). */
 export function titleFromUserText(text: string, maxLen = 72): string {
@@ -23,10 +29,8 @@ export function titleFromUserText(text: string, maxLen = 72): string {
 export async function generateSessionTitle(opts: {
   userText: string;
   assistantText?: string;
-  model?: { providerID: string; modelID: string };
   timeoutMs?: number;
-}): Promise<string> {
-  const fallback = titleFromUserText(opts.userText) || 'New session';
+}): Promise<string | null> {
   const user = opts.userText.slice(0, 800);
   const asst = (opts.assistantText || '').slice(0, 600);
   const prompt =
@@ -36,12 +40,12 @@ export async function generateSessionTitle(opts: {
     (asst ? `Assistant:\n${asst}\n` : '');
 
   try {
-    const title = await runPiPrint(prompt, opts.model, opts.timeoutMs ?? 25000);
+    const title = await runPiPrint(prompt, TITLE_GENERATION_MODEL, opts.timeoutMs ?? 25000);
     const cleaned = cleanTitle(title);
-    return cleaned || fallback;
+    return cleaned || null;
   } catch (err) {
-    console.warn('[title-gen] failed, using heuristic:', err);
-    return fallback;
+    console.warn('[title-gen] failed:', err);
+    return null;
   }
 }
 
@@ -69,32 +73,20 @@ function runPiPrint(
   if (model?.providerID && model?.modelID) {
     args.push('--model', `${model.providerID}/${model.modelID}`);
   }
-  args.push(message);
 
   return new Promise((resolve, reject) => {
     if (process.platform === 'win32') {
-      // Windows: run via PowerShell so pi.cmd is discoverable; pass args via $args to avoid quoting issues
-      execFile(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', '& pi @args', ...args],
-        {
-          env: process.env,
-          timeout: timeoutMs,
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024,
-          windowsHide: true,
-        },
-        (err, stdout) => {
-          if (err) return reject(err);
-          resolve(stdout.trim());
-        },
-      );
+      const script = fileURLToPath(new URL('../scripts/run-pi.ps1', import.meta.url));
+      const child = spawn('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-File', script, ...args,
+      ], { env: process.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      collectChildOutput(child, message, timeoutMs, resolve, reject);
       return;
     }
 
     execFile(
       'pi',
-      args,
+      [...args, message],
       {
         env: process.env,
         timeout: timeoutMs,
@@ -107,4 +99,36 @@ function runPiPrint(
       },
     );
   });
+}
+
+function collectChildOutput(
+  child: ReturnType<typeof spawn>,
+  input: string,
+  timeoutMs: number,
+  resolve: (value: string) => void,
+  reject: (reason?: unknown) => void,
+): void {
+  let stdout = '';
+  let stderr = '';
+  const timer = setTimeout(() => {
+    child.kill();
+    reject(new Error('title generation timed out'));
+  }, timeoutMs);
+
+  child.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
+  child.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+  child.once('error', (err) => {
+    clearTimeout(timer);
+    reject(err);
+  });
+  child.once('close', (code) => {
+    clearTimeout(timer);
+    if (code !== 0 && !stdout.trim()) {
+      reject(new Error(stderr.trim() || `pi exited ${code}`));
+      return;
+    }
+    resolve(stdout.trim());
+  });
+
+  child.stdin?.end(input);
 }

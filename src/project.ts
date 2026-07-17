@@ -3,6 +3,12 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 
+const PROJECT_CACHE_TTL = 60_000;
+const projectCache = new Map<string, {
+  value: { id: string; worktree: string; vcs: string | null };
+  expiresAt: number;
+}>();
+
 /**
  * Match OpenCode's Project.fromDirectory for git repos.
  *
@@ -15,6 +21,15 @@ import { join, dirname, resolve } from 'node:path';
  */
 export function getProjectId(directory: string): { id: string; worktree: string; vcs: string | null } {
   const dir = resolve(directory);
+  const cached = projectCache.get(dir);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const value = resolveProjectId(dir);
+  projectCache.set(dir, { value, expiresAt: Date.now() + PROJECT_CACHE_TTL });
+  return value;
+}
+
+function resolveProjectId(dir: string): { id: string; worktree: string; vcs: string | null } {
   const gitDir = findGitDir(dir);
   if (!gitDir) {
     return {
