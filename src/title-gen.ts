@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 
 /** Short human title from first user prompt (no extra LLM call). */
 export function titleFromUserText(text: string, maxLen = 72): string {
@@ -65,38 +65,46 @@ function runPiPrint(
   model?: { providerID: string; modelID: string },
   timeoutMs = 25000,
 ): Promise<string> {
+  const args = ['-p', '--no-session'];
+  if (model?.providerID && model?.modelID) {
+    args.push('--model', `${model.providerID}/${model.modelID}`);
+  }
+  args.push(message);
+
   return new Promise((resolve, reject) => {
-    const args = ['-p', '--no-session', '--tools', ''];
-    if (model?.providerID && model?.modelID) {
-      args.push('--model', `${model.providerID}/${model.modelID}`);
+    if (process.platform === 'win32') {
+      // Windows: run via PowerShell so pi.cmd is discoverable; pass args via $args to avoid quoting issues
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', '& pi @args', ...args],
+        {
+          env: process.env,
+          timeout: timeoutMs,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024,
+          windowsHide: true,
+        },
+        (err, stdout) => {
+          if (err) return reject(err);
+          resolve(stdout.trim());
+        },
+      );
+      return;
     }
-    args.push(message);
 
-    const child = spawn('pi', args, {
-      env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error('title generation timed out'));
-    }, timeoutMs);
-
-    child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-    child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0 && !stdout.trim()) {
-        reject(new Error(stderr.slice(0, 200) || `pi exited ${code}`));
-        return;
-      }
-      resolve(stdout.trim());
-    });
+    execFile(
+      'pi',
+      args,
+      {
+        env: process.env,
+        timeout: timeoutMs,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024,
+      },
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(stdout.trim());
+      },
+    );
   });
 }

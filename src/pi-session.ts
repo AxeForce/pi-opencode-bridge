@@ -82,7 +82,17 @@ export class PiSession extends EventEmitter {
         args.push('--tools', this.options.tools.join(','));
       }
       if (this.options.model) {
-        args.push('--model', `${this.options.model.provider}/${this.options.model.id}`);
+        const modelArg = `${this.options.model.provider}/${this.options.model.id}`;
+        args.push('--model', modelArg);
+      }
+      if (process.platform === 'win32') {
+        for (const arg of args) {
+          if (arg.startsWith('--')) continue;
+          if (/["&|<>^%!()\r\n]/.test(arg)) {
+            reject(new PiRPCError('INVALID_ARGUMENT', 'Unsafe argument for Windows shell execution'));
+            return;
+          }
+        }
       }
 
       this.dead = false;
@@ -90,6 +100,7 @@ export class PiSession extends EventEmitter {
         cwd: this.cwd,
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       this.process.stdout!.on('data', (data: Buffer) => this.handleData(data));

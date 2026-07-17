@@ -88,28 +88,31 @@ export function loadPiAgents(): PiAgent[] {
   }
 
   // Also pull commands from pi RPC if available (cached)
-  try {
-    const output = execSync(
-      `printf '%s\\n' '{"type":"get_commands","id":"1"}' | pi --mode rpc --no-session 2>/dev/null | grep '"type":"response"' | head -1`,
-      { encoding: 'utf-8', timeout: 8000, shell: '/bin/bash' },
-    );
-    if (output.trim()) {
-      const parsed = JSON.parse(output);
-      const commands = parsed?.data?.commands || [];
-      for (const cmd of commands) {
-        if (cmd.source !== 'prompt') continue;
-        if (agents.some(a => a.name === cmd.name)) continue;
-        agents.push({
-          name: cmd.name,
-          description: cmd.description || `Pi prompt: ${cmd.name}`,
-          mode: 'subagent',
-          native: false,
-          promptPrefix: `/${cmd.name} `,
-          permission: DEFAULT_PERMISSION,
-        });
+  // ponytail: bash-only pipeline, skip on Windows (static agents work fine)
+  if (process.platform !== 'win32') {
+    try {
+      const output = execSync(
+        `printf '%s\\n' '{"type":"get_commands","id":"1"}' | pi --mode rpc --no-session 2>/dev/null | grep '"type":"response"' | head -1`,
+        { encoding: 'utf-8', timeout: 8000, shell: '/bin/bash' },
+      );
+      if (output.trim()) {
+        const parsed = JSON.parse(output);
+        const commands = parsed?.data?.commands || [];
+        for (const cmd of commands) {
+          if (cmd.source !== 'prompt') continue;
+          if (agents.some(a => a.name === cmd.name)) continue;
+          agents.push({
+            name: cmd.name,
+            description: cmd.description || `Pi prompt: ${cmd.name}`,
+            mode: 'subagent',
+            native: false,
+            promptPrefix: `/${cmd.name} `,
+            permission: DEFAULT_PERMISSION,
+          });
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   return agents;
 }

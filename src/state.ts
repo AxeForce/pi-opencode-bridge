@@ -254,7 +254,6 @@ export class ServerState {
   async applyLlmTitle(sessionId: string, userText: string, assistantText?: string): Promise<void> {
     const session = this.getSession(sessionId);
     if (!session || session.llmTitleDone) return;
-    // Manual renames lock both flags
     if (session.titleLocked) return;
     session.llmTitleDone = true;
     try {
