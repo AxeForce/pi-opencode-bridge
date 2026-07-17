@@ -579,7 +579,10 @@ export class StreamAdapter {
 
   async waitForIdle(
     afterGeneration = this.runGeneration - 1,
-    timeoutMs = Number(process.env.PI_SYNC_TIMEOUT_MS || 30 * 60 * 1000),
+    timeoutMs = (() => {
+      const v = Number(process.env.PI_SYNC_TIMEOUT_MS);
+      return Number.isFinite(v) && v > 0 ? v : 30 * 60 * 1000;
+    })(),
   ): Promise<void> {
     if (
       this.runGeneration > afterGeneration &&
