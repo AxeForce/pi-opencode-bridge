@@ -75,16 +75,13 @@ function runPiPrint(
 
       let output: string;
       if (process.platform === 'win32') {
-        // Windows: .cmd files can't be execFileSync'd; use PowerShell with proper arg escaping
-        const escaped = args.map(a => a.replace(/'/g, "''"));
-        const psCmd = `& pi ${escaped.map(a => `'${a}'`).join(' ')}`;
-        output = execSync(psCmd, {
+        // Windows: run via PowerShell so pi.cmd is discoverable; pass args via $args to avoid quoting issues
+        output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '& pi @args', ...args], {
           env: process.env,
           timeout: timeoutMs,
           encoding: 'utf-8',
           maxBuffer: 1024 * 1024,
           windowsHide: true,
-          shell: 'powershell.exe',
         });
       } else {
         output = execFileSync('pi', args, {
