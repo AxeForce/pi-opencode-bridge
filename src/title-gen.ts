@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 
 /** Short human title from first user prompt (no extra LLM call). */
 export function titleFromUserText(text: string, maxLen = 72): string {
@@ -65,35 +65,46 @@ function runPiPrint(
   model?: { providerID: string; modelID: string },
   timeoutMs = 25000,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    try {
-      const args = ['-p', '--no-session'];
-      if (model?.providerID && model?.modelID) {
-        args.push('--model', `${model.providerID}/${model.modelID}`);
-      }
-      args.push(message);
+  const args = ['-p', '--no-session'];
+  if (model?.providerID && model?.modelID) {
+    args.push('--model', `${model.providerID}/${model.modelID}`);
+  }
+  args.push(message);
 
-      let output: string;
-      if (process.platform === 'win32') {
-        // Windows: run via PowerShell so pi.cmd is discoverable; pass args via $args to avoid quoting issues
-        output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '& pi @args', ...args], {
+  return new Promise((resolve, reject) => {
+    if (process.platform === 'win32') {
+      // Windows: run via PowerShell so pi.cmd is discoverable; pass args via $args to avoid quoting issues
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', '& pi @args', ...args],
+        {
           env: process.env,
           timeout: timeoutMs,
           encoding: 'utf-8',
           maxBuffer: 1024 * 1024,
           windowsHide: true,
-        });
-      } else {
-        output = execFileSync('pi', args, {
-          env: process.env,
-          timeout: timeoutMs,
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024,
-        });
-      }
-      resolve(output.trim());
-    } catch (err: any) {
-      reject(err);
+        },
+        (err, stdout) => {
+          if (err) return reject(err);
+          resolve(stdout.trim());
+        },
+      );
+      return;
     }
+
+    execFile(
+      'pi',
+      args,
+      {
+        env: process.env,
+        timeout: timeoutMs,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024,
+      },
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(stdout.trim());
+      },
+    );
   });
 }
