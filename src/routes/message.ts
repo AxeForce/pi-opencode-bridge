@@ -128,6 +128,7 @@ async function handleStreamingPrompt(
       if (mode === 'sync') await adapter.waitForIdle(generation - 1);
       await adapter.sendFollowUp(actualText);
       if (mode === 'sync') await adapter.waitForIdle(generation - 1);
+    }
 
     if (mode === 'sync') {
       const message = latestAssistantMessage(state, sessionId);
