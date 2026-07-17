@@ -240,7 +240,7 @@ export class PiSession extends EventEmitter {
   }
 
   async followUp(message: string): Promise<void> {
-    await this.sendCommand({ type: 'followUp', message });
+    await this.prompt(message, { streamingBehavior: 'followUp' });
   }
 
   async abort(): Promise<void> {

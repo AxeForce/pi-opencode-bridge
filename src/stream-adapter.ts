@@ -121,9 +121,11 @@ export class StreamAdapter {
   /** Sum of turn usages for the whole agent run (multi-step tool loops) */
   private agentUsage: PiUsage = emptyUsage();
   private idleWaiters = new Set<{
+    afterGeneration: number;
     resolve: () => void;
     timer: NodeJS.Timeout;
   }>();
+  private runGeneration = 0;
 
   constructor(state: ServerState, session: ManagedSession, model: { providerID: string; modelID: string }) {
     this.state = state;
@@ -179,7 +181,7 @@ export class StreamAdapter {
       this.state.sessions.get(this.session.id) !== this.session ||
       this.session.piSession !== this.pi
     ) {
-      this.resolveIdleWaiters();
+      this.forceResolveIdleWaiters();
       return;
     }
 
@@ -217,7 +219,7 @@ export class StreamAdapter {
       properties: { sessionID: this.session.id },
     });
     this.state.persist(this.session);
-    this.resolveIdleWaiters();
+    this.forceResolveIdleWaiters();
   }
 
   async setModel(providerID: string, modelID: string): Promise<void> {
@@ -258,6 +260,7 @@ export class StreamAdapter {
   }
 
   private onAgentStart(): void {
+    this.runGeneration++;
     this.stepStartTime = Date.now();
     this.activeTextPart = null;
     this.activeReasoningPart = null;
@@ -570,11 +573,23 @@ export class StreamAdapter {
     this.resolveIdleWaiters();
   }
 
-  async waitForIdle(timeoutMs = Number(process.env.PI_SYNC_TIMEOUT_MS || 30 * 60 * 1000)): Promise<void> {
-    if (!this.isStreaming && this.session.status.type === 'idle') return;
+  get generation(): number {
+    return this.runGeneration;
+  }
+
+  async waitForIdle(
+    afterGeneration = this.runGeneration - 1,
+    timeoutMs = Number(process.env.PI_SYNC_TIMEOUT_MS || 30 * 60 * 1000),
+  ): Promise<void> {
+    if (
+      this.runGeneration > afterGeneration &&
+      !this.isStreaming &&
+      this.session.status.type === 'idle'
+    ) return;
 
     return new Promise((resolve, reject) => {
       const waiter = {
+        afterGeneration,
         resolve: () => {
           clearTimeout(waiter.timer);
           this.idleWaiters.delete(waiter);
@@ -590,6 +605,14 @@ export class StreamAdapter {
   }
 
   private resolveIdleWaiters(): void {
+    for (const waiter of Array.from(this.idleWaiters)) {
+      if (this.runGeneration > waiter.afterGeneration && !this.isStreaming && this.session.status.type === 'idle') {
+        waiter.resolve();
+      }
+    }
+  }
+
+  private forceResolveIdleWaiters(): void {
     for (const waiter of Array.from(this.idleWaiters)) {
       waiter.resolve();
     }
@@ -764,12 +787,16 @@ export class StreamAdapter {
     return this.pi.prompt(message, streaming ? { streamingBehavior: 'followUp' } : undefined);
   }
 
+  async sendFollowUp(message: string): Promise<void> {
+    return this.pi.prompt(message, { streamingBehavior: 'followUp' });
+  }
+
   async sendSteer(message: string): Promise<void> {
     return this.pi.steer(message);
   }
 
   get isStreaming(): boolean {
-    return this.pi.streaming || this.session.status?.type === 'busy';
+    return this.pi.streaming;
   }
 
   async abort(): Promise<void> {
