@@ -82,7 +82,12 @@ export class PiSession extends EventEmitter {
         args.push('--tools', this.options.tools.join(','));
       }
       if (this.options.model) {
-        args.push('--model', `${this.options.model.provider}/${this.options.model.id}`);
+        const modelArg = `${this.options.model.provider}/${this.options.model.id}`;
+        if (process.platform === 'win32' && /["&|<>^%!\\r\\n]/.test(modelArg)) {
+          reject(new PiRPCError('INVALID_ARGUMENT', 'Unsafe model argument for Windows shell execution'));
+          return;
+        }
+        args.push('--model', modelArg);
       }
 
       this.dead = false;
