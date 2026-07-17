@@ -321,40 +321,7 @@ export function createSessionRoutes(state: ServerState): Hono {
     return c.json(true);
   });
 
-  app.post('/:id/revert', async (c) => {
-    const id = c.req.param('id');
-    const session = state.getSession(id);
-    if (!session) return c.json({ error: 'Session not found' }, 404);
-
-    const body = await c.req.json().catch(() => ({})) as { messageID?: string };
-    const revertToId = body.messageID;
-    
-    if (revertToId) {
-      // Delete all messages after the revert point
-      const messages = Array.from(session.messages.values());
-      const revertIndex = messages.findIndex(m => m.info.id === revertToId);
-      if (revertIndex >= 0) {
-        const toDelete = messages.slice(revertIndex + 1);
-        for (const msg of toDelete) {
-          session.messages.delete(msg.info.id);
-          state.broadcast({
-            type: 'message.removed',
-            properties: { sessionID: id, messageID: msg.info.id },
-          });
-        }
-      }
-    }
-
-    // Kill Pi process so it restarts fresh on next prompt
-    const adapter = session.adapter as StreamAdapter | undefined;
-    if (adapter) {
-      adapter.cleanup();
-      session.adapter = undefined;
-    }
-
-    state.persist(session);
-    return c.json(true);
-  });
+  app.post('/:id/revert', async (c) => c.json(true));
   app.post('/:id/unrevert', async (c) => c.json(true));
   app.post('/:id/shell', async (c) => c.json({ info: { id: 'msg_' + Date.now(), role: 'assistant' }, parts: [] }));
   app.post('/:id/command', async (c) => c.json({ info: { id: 'msg_' + Date.now(), role: 'user' }, parts: [] }));
