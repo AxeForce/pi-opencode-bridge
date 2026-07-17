@@ -90,6 +90,7 @@ export class PiSession extends EventEmitter {
         cwd: this.cwd,
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       this.process.stdout!.on('data', (data: Buffer) => this.handleData(data));

@@ -12,8 +12,12 @@ const MAX_RESULTS = 100;
 const MAX_DEPTH = 12;
 
 function which(bin: string): string | null {
-  const r = spawnSync('which', [bin], { encoding: 'utf-8' });
-  if (r.status === 0) return r.stdout.trim() || null;
+  const cmd = process.platform === 'win32' ? 'where' : 'which';
+  const r = spawnSync(cmd, [bin], { encoding: 'utf-8', shell: process.platform === 'win32' });
+  if (r.status === 0) {
+    const first = (r.stdout || '').split('\n').map(l => l.trim()).find(Boolean);
+    return first || null;
+  }
   return null;
 }
 
