@@ -55,7 +55,7 @@ export function createGlobalRoutes(state: ServerState): Hono {
         } catch {
           clearInterval(heartbeat);
         }
-      }, 30000);
+      }, 10000);
 
       const unsubscribe = state.subscribe((event) => {
         // Instance bus: raw event, no payload wrapper
@@ -96,7 +96,7 @@ export function createGlobalRoutes(state: ServerState): Hono {
         } catch {
           clearInterval(heartbeat);
         }
-      }, 30000);
+      }, 10000);
 
       const unsubscribe = state.subscribe((event) => {
         // Attach directory when available on the event properties
