@@ -299,11 +299,15 @@ async function handlePrompt(
   });
 
   if (mode === 'async') {
-    void task.then(result => {
-      if (!result.ok) {
-        console.error(`[message] async prompt failed session=${sessionId}: ${result.error}`);
-      }
-    });
+    void task
+      .then(result => {
+        if (!result.ok) {
+          console.error(`[message] async prompt failed session=${sessionId}: ${result.error}`);
+        }
+      })
+      .catch(err => {
+        console.error(`[message] async prompt crashed session=${sessionId}:`, err);
+      });
     return { ok: true as const };
   }
 
