@@ -11,6 +11,8 @@ export interface PiModel {
   maxTokens: number;
   reasoning: boolean;
   images: boolean;
+  /** Per-model thinking level map from models.json — keys are supported variants */
+  thinkingLevelMap?: Record<string, string | null>;
 }
 
 export interface PiSettings {
@@ -83,6 +85,7 @@ export function loadPiModels(): PiModel[] {
             found.name = m.name || found.name;
             if (m.contextWindow) found.contextWindow = m.contextWindow;
             if (m.maxTokens) found.maxTokens = m.maxTokens;
+            found.thinkingLevelMap = m.thinkingLevelMap || m.thinkingLevels;
           }
         }
       }
@@ -105,9 +108,26 @@ export function loadPiModels(): PiModel[] {
 }
 
 function buildOpenCodeModel(m: PiModel) {
+  // Determine supported variants from thinkingLevelMap
+  let variants: Record<string, object> = {};
+  if (m.reasoning) {
+    if (m.thinkingLevelMap) {
+      for (const [level, mapped] of Object.entries(m.thinkingLevelMap)) {
+        if (mapped !== null) {
+          variants[level] = {};
+        }
+      }
+    }
+    // Always include 'off' (no thinking)
+    variants['off'] = {};
+    // Fallback: no map → assume all 7 levels
+    if (Object.keys(variants).length <= 1) {
+      const all = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      for (const v of all) variants[v] = {};
+    }
+  }
   return {
     id: m.id,
-    providerID: m.provider,
     name: m.name,
     family: m.id,
     api: {
@@ -149,17 +169,7 @@ function buildOpenCodeModel(m: PiModel) {
       interleaved: m.reasoning ? { field: 'reasoning_content' } : false,
     },
     release_date: '2025-01-01',
-    variants: m.reasoning
-      ? {
-          off: {},
-          minimal: {},
-          low: {},
-          medium: {},
-          high: {},
-          xhigh: {},
-          max: {},
-        }
-      : {},
+    variants,
   };
 }
 
