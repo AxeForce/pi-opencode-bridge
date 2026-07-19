@@ -286,6 +286,10 @@ export class PiSession extends EventEmitter {
     return this.sendCommand({ type: 'set_model', provider, modelId });
   }
 
+  async setThinkingLevel(level: string): Promise<unknown> {
+    return this.sendCommand({ type: 'set_thinking_level', thinkingLevel: level });
+  }
+
   async compact(): Promise<unknown> {
     return this.sendCommand({ type: 'compact' });
   }

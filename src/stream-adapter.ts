@@ -231,6 +231,14 @@ export class StreamAdapter {
     }
   }
 
+  async setThinkingLevel(level: string): Promise<void> {
+    try {
+      await this.pi.setThinkingLevel(level);
+    } catch (err) {
+      console.warn('[stream-adapter] setThinkingLevel failed:', err);
+    }
+  }
+
   private ensureAssistantMessage(): string {
     if (this.session.currentMessageId) {
       const existing = this.session.messages.get(this.session.currentMessageId);

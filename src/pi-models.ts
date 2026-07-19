@@ -151,9 +151,13 @@ function buildOpenCodeModel(m: PiModel) {
     release_date: '2025-01-01',
     variants: m.reasoning
       ? {
-          low: { thinking_budget: 2000 },
-          medium: { thinking_budget: 8000 },
-          high: { thinking_budget: 16000 },
+          off: {},
+          minimal: {},
+          low: {},
+          medium: {},
+          high: {},
+          xhigh: {},
+          max: {},
         }
       : {},
   };

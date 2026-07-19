@@ -64,6 +64,7 @@ interface PromptBody {
   noReply?: boolean;
   system?: string;
   tools?: Record<string, boolean>;
+  variant?: string;
   parts?: Array<{ type: string; text?: string; [key: string]: unknown }>;
 }
 
@@ -196,9 +197,12 @@ async function handlePrompt(
     // Model
     const model = body.model || session.model || getDefaultModelRef();
     session.model = model;
-    if (body.model?.providerID && body.model?.modelID) {
-      await adapter.setModel(body.model.providerID, body.model.modelID);
-    }
+      if (body.model?.providerID && body.model?.modelID) {
+        await adapter.setModel(body.model.providerID, body.model.modelID);
+      }
+      if (body.variant) {
+        await adapter.setThinkingLevel(body.variant).catch(() => {});
+      }
 
     // Use client-supplied messageID if valid, else generate
     const userMsgId = (body.messageID && body.messageID.startsWith('msg_'))
