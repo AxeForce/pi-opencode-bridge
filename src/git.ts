@@ -1,6 +1,9 @@
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
+
+const execFileAsync = promisify(execFile);
 
 export interface FileDiff {
   file: string;
@@ -12,15 +15,19 @@ export interface FileDiff {
   after?: string;
 }
 
-function runGit(cwd: string, args: string[]): { ok: boolean; out: string } {
-  const r = spawnSync('git', args, {
-    cwd,
-    encoding: 'utf-8',
-    timeout: 15000,
-    maxBuffer: 12 * 1024 * 1024,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-  });
-  return { ok: r.status === 0, out: (r.stdout || '') + (r.stderr || '') };
+async function runGit(cwd: string, args: string[]): Promise<{ ok: boolean; out: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      timeout: 15000,
+      maxBuffer: 12 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+    return { ok: true, out: (stdout || '') + (stderr || '') };
+  } catch (err: any) {
+    return { ok: false, out: (err.stdout || '') + (err.stderr || '') };
+  }
 }
 
 export function findGitRoot(start: string): string | null {
@@ -34,17 +41,16 @@ export function findGitRoot(start: string): string | null {
   return null;
 }
 
-export function getBranch(directory: string): string | null {
+export async function getBranch(directory: string): Promise<string | null> {
   const root = findGitRoot(directory);
   if (!root) return null;
-  const r = runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const r = await runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
   if (!r.ok) return null;
   const b = r.out.trim();
   return b && b !== 'HEAD' ? b : b || null;
 }
 
 function parseNumstat(line: string): { file: string; additions: number; deletions: number } | null {
-  // additions\tdeletions\tpath  (binary: -\t-\tpath)
   const parts = line.split('\t');
   if (parts.length < 3) return null;
   const [a, d, ...rest] = parts;
@@ -55,14 +61,12 @@ function parseNumstat(line: string): { file: string; additions: number; deletion
   return { file, additions, deletions };
 }
 
-function filePatch(root: string, file: string, staged: boolean): string {
+async function filePatch(root: string, file: string, staged: boolean): Promise<string> {
   const args = staged
     ? ['diff', '--cached', '--', file]
     : ['diff', 'HEAD', '--', file];
-  // For untracked, show as /dev/null diff via no-index is awkward; use empty before
-  const r = runGit(root, args);
+  const r = await runGit(root, args);
   if (r.ok && r.out.trim()) return r.out;
-  // Untracked: invent a simple patch header + content preview
   try {
     const full = join(root, file);
     if (!existsSync(full)) return '';
@@ -76,18 +80,16 @@ function filePatch(root: string, file: string, staged: boolean): string {
 }
 
 function classifyStatus(code: string): 'added' | 'deleted' | 'modified' {
-  // porcelain XY codes
   if (code.includes('A') || code === '??') return 'added';
   if (code.includes('D')) return 'deleted';
   return 'modified';
 }
 
-/** OpenCode /file/status → FileDiff[] for dirty worktree */
-export function getFileStatus(directory: string): FileDiff[] {
+export async function getFileStatus(directory: string): Promise<FileDiff[]> {
   const root = findGitRoot(directory);
   if (!root) return [];
 
-  const status = runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-uall']);
+  const status = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-uall']);
   if (!status.ok && !status.out.trim()) return [];
 
   const byFile = new Map<string, FileDiff>();
@@ -96,13 +98,12 @@ export function getFileStatus(directory: string): FileDiff[] {
     if (!line || line.length < 4) continue;
     const code = line.slice(0, 2);
     let path = line.slice(3);
-    // renames: "R  old -> new"
     if (path.includes(' -> ')) path = path.split(' -> ').pop() || path;
     path = path.replace(/^"|"$/g, '');
     if (!path) continue;
 
     const statusKind = classifyStatus(code);
-    const num = runGit(root, ['diff', '--numstat', 'HEAD', '--', path]);
+    const num = await runGit(root, ['diff', '--numstat', 'HEAD', '--', path]);
     let additions = 0;
     let deletions = 0;
     if (num.ok) {
@@ -121,7 +122,7 @@ export function getFileStatus(directory: string): FileDiff[] {
       } catch { /* */ }
     }
 
-    const patch = filePatch(root, path, code[0] !== ' ' && code[0] !== '?');
+    const patch = await filePatch(root, path, code[0] !== ' ' && code[0] !== '?');
     byFile.set(path, {
       file: path,
       patch,
@@ -134,8 +135,7 @@ export function getFileStatus(directory: string): FileDiff[] {
   return Array.from(byFile.values()).sort((a, b) => a.file.localeCompare(b.file));
 }
 
-/** Diff for specific files (session-touched), falling back to full worktree status */
-export function getDiffsForFiles(directory: string, files?: string[]): FileDiff[] {
+export async function getDiffsForFiles(directory: string, files?: string[]): Promise<FileDiff[]> {
   const root = findGitRoot(directory);
   if (!root) return [];
 
@@ -147,14 +147,13 @@ export function getDiffsForFiles(directory: string, files?: string[]): FileDiff[
   const out: FileDiff[] = [];
 
   for (const file of unique) {
-    // Resolve relative to root
     let rel = file;
     if (rel.startsWith('/')) {
       rel = relative(root, rel);
       if (rel.startsWith('..')) continue;
     }
 
-    const num = runGit(root, ['diff', '--numstat', 'HEAD', '--', rel]);
+    const num = await runGit(root, ['diff', '--numstat', 'HEAD', '--', rel]);
     let additions = 0;
     let deletions = 0;
     let found = false;
@@ -170,7 +169,7 @@ export function getDiffsForFiles(directory: string, files?: string[]): FileDiff[
     }
 
     const exists = existsSync(join(root, rel));
-    const inHead = runGit(root, ['cat-file', '-e', `HEAD:${rel}`]);
+    const inHead = await runGit(root, ['cat-file', '-e', `HEAD:${rel}`]);
     let status: FileDiff['status'] = 'modified';
     if (!inHead.ok && exists) {
       status = 'added';
@@ -185,7 +184,7 @@ export function getDiffsForFiles(directory: string, files?: string[]): FileDiff[
       found = true;
     }
 
-    const patch = filePatch(root, rel, false);
+    const patch = await filePatch(root, rel, false);
     if (!found && !patch.trim()) continue;
 
     out.push({

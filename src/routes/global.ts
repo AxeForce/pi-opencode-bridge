@@ -176,9 +176,9 @@ export function createGlobalRoutes(state: ServerState): Hono {
   });
 
   // VCS info
-  app.get('/vcs', (c) => {
+  app.get('/vcs', async (c) => {
     const dir = getRequestDirectory(c, state.workingDir);
-    return c.json({ branch: getBranch(dir) });
+    return c.json({ branch: await getBranch(dir) });
   });
 
   function buildConfig() {

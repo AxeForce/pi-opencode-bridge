@@ -85,9 +85,9 @@ export function createFileRoutes(state: ServerState): Hono {
   });
 
   // Git dirty status as FileDiff[]
-  app.get('/file/status', (c) => {
+  app.get('/file/status', async (c) => {
     const root = getRoot(state, c);
-    return c.json(getFileStatus(root));
+    return c.json(await getFileStatus(root));
   });
 
   return app;

@@ -649,8 +649,8 @@ export class StreamAdapter {
       const files = this.session.touchedFiles ? Array.from(this.session.touchedFiles) : [];
       if (!files.length) return;
       // dynamic to avoid circular import weight at load
-      import('./git.js').then(({ getDiffsForFiles, summarizeDiffs }) => {
-        const diffs = getDiffsForFiles(this.session.workingDir, files);
+      import('./git.js').then(async ({ getDiffsForFiles, summarizeDiffs }) => {
+        const diffs = await getDiffsForFiles(this.session.workingDir, files);
         const summary = summarizeDiffs(diffs);
         (this.session.opencodeSession as any).summary = {
           additions: summary.additions,

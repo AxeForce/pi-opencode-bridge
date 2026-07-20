@@ -255,13 +255,12 @@ export function createSessionRoutes(state: ServerState): Hono {
   });
 
   // Diff
-  app.get('/:id/diff', (c) => {
+  app.get('/:id/diff', async (c) => {
     const id = c.req.param('id');
     const session = state.getSession(id);
     if (!session) return c.json([]);
     const files = session.touchedFiles ? Array.from(session.touchedFiles) : [];
-    const diffs = getDiffsForFiles(session.workingDir, files.length ? files : undefined);
-    // Keep session.summary in sync for desktop badges
+    const diffs = await getDiffsForFiles(session.workingDir, files.length ? files : undefined);
     const summary = summarizeDiffs(diffs);
     (session.opencodeSession as any).summary = {
       additions: summary.additions,
