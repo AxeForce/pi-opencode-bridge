@@ -40,7 +40,7 @@ export async function generateSessionTitle(opts: {
     (asst ? `Assistant:\n${asst}\n` : '');
 
   try {
-    const title = await runPiPrint(prompt, TITLE_GENERATION_MODEL, opts.timeoutMs ?? 25000);
+    const title = await runPiPrint(prompt, opts.timeoutMs ?? 25000);
     const cleaned = cleanTitle(title);
     return cleaned || null;
   } catch (err) {
@@ -66,69 +66,40 @@ function cleanTitle(raw: string): string {
 
 function runPiPrint(
   message: string,
-  model?: { providerID: string; modelID: string },
   timeoutMs = 25000,
 ): Promise<string> {
-  const args = ['-p', '--no-session'];
-  if (model?.providerID && model?.modelID) {
-    args.push('--model', `${model.providerID}/${model.modelID}`);
-  }
+  const args = ['-p', '--no-session', '--model', 'opencode-go/deepseek-v4-flash'];
 
   return new Promise((resolve, reject) => {
-    if (process.platform === 'win32') {
-      const script = fileURLToPath(new URL('../scripts/run-pi.ps1', import.meta.url));
-      const child = spawn('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-File', script, ...args,
-      ], { env: process.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-      collectChildOutput(child, message, timeoutMs, resolve, reject);
-      return;
-    }
+    const child = spawn('pi', args, {
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
-    execFile(
-      'pi',
-      [...args, message],
-      {
-        env: process.env,
-        timeout: timeoutMs,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024,
-      },
-      (err, stdout) => {
-        if (err) return reject(err);
-        resolve(stdout.trim());
-      },
-    );
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('title generation timed out'));
+    }, timeoutMs);
+
+    child.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+    child.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && !stdout.trim()) {
+        reject(new Error(stderr.trim() || `pi exited ${code}`));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+    child.on('spawn', () => {
+      child.stdin?.write(message + '\n');
+      child.stdin?.end();
+    });
   });
-}
-
-function collectChildOutput(
-  child: ReturnType<typeof spawn>,
-  input: string,
-  timeoutMs: number,
-  resolve: (value: string) => void,
-  reject: (reason?: unknown) => void,
-): void {
-  let stdout = '';
-  let stderr = '';
-  const timer = setTimeout(() => {
-    child.kill();
-    reject(new Error('title generation timed out'));
-  }, timeoutMs);
-
-  child.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
-  child.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
-  child.once('error', (err) => {
-    clearTimeout(timer);
-    reject(err);
-  });
-  child.once('close', (code) => {
-    clearTimeout(timer);
-    if (code !== 0 && !stdout.trim()) {
-      reject(new Error(stderr.trim() || `pi exited ${code}`));
-      return;
-    }
-    resolve(stdout.trim());
-  });
-
-  child.stdin?.end(input);
 }
