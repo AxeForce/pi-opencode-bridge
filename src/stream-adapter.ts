@@ -18,6 +18,7 @@ import type {
 } from './types/parts.js';
 import { newPartID, newCallID } from './id.js';
 import type { Tokens } from './types/common.js';
+import { addFileDiffMetadata } from './tool-metadata.js';
 
 // Map Pi tool names to OpenCode tool names for UI rendering
 function mapToolName(name: string): string {
@@ -163,12 +164,12 @@ export class StreamAdapter {
     this.pi.on('exit', (code: number) => this.onPiExit(code));
   }
 
-  private applyUsageToMessage(msgId: string | null, usage: PiUsage): void {
+  private applyUsageToMessage(msgId: string | null, usage: PiUsage, cost = usage.cost): void {
     if (!msgId) return;
     const msg = this.session.messages.get(msgId);
     if (!msg || msg.info.role !== 'assistant') return;
     (msg.info as any).tokens = toOpenCodeTokens(usage);
-    (msg.info as any).cost = usage.cost;
+    (msg.info as any).cost = cost;
     this.state.broadcast({
       type: 'message.updated',
       properties: { info: msg.info } as any,
@@ -286,7 +287,11 @@ export class StreamAdapter {
     // Prefer latest non-zero usage for the current turn (turn_end may also apply)
     if (usage.input || usage.output || usage.reasoning || usage.cacheRead || usage.cost) {
       this.turnUsage = usage;
-      this.applyUsageToMessage(this.session.currentMessageId, addUsage(this.agentUsage, usage));
+      this.applyUsageToMessage(
+        this.session.currentMessageId,
+        usage,
+        this.agentUsage.cost + usage.cost,
+      );
     }
   }
 
@@ -435,12 +440,7 @@ export class StreamAdapter {
           truncated: lines.length > 20,
         };
       } else if (toolName === 'edit' || toolName === 'write') {
-        if (metadata.diff) {
-          metadata.filediff = metadata.diff;
-        }
-        if (metadata.patch) {
-          metadata.filediff = metadata.patch;
-        }
+        metadata = addFileDiffMetadata(metadata, part.state.input);
       }
 
       // Track files for session.diff
@@ -512,23 +512,34 @@ export class StreamAdapter {
     this.state.addPartToCurrentMessage(this.session.id, stepFinish);
     this.emitPartUpdated(stepFinish);
 
-    // Keep assistant message tokens as running sum across tool-loop turns
-    this.applyUsageToMessage(messageId, this.agentUsage);
+    // Tokens describe the latest context snapshot; cost accumulates across tool-loop turns.
+    this.applyUsageToMessage(messageId, usage, this.agentUsage.cost);
   }
 
   private onAgentEnd(event: any): void {
-    // Prefer summing assistant usages from agent_end.messages when present
-    if (Array.isArray(event?.messages)) {
+    // Fall back to agent_end data only if Pi did not emit turn_end usage.
+    if (
+      !this.agentUsage.input &&
+      !this.agentUsage.output &&
+      !this.agentUsage.reasoning &&
+      !this.agentUsage.cacheRead &&
+      Array.isArray(event?.messages)
+    ) {
       let summed = emptyUsage();
+      let latest = emptyUsage();
       let found = false;
       for (const m of event.messages) {
         if (m?.role !== 'assistant') continue;
         const u = extractPiUsage(m);
         if (!u) continue;
         summed = addUsage(summed, u);
+        latest = u;
         found = true;
       }
-      if (found) this.agentUsage = summed;
+      if (found) {
+        this.agentUsage = summed;
+        this.turnUsage = latest;
+      }
     }
 
     // Finalize the assistant message
@@ -538,7 +549,7 @@ export class StreamAdapter {
       if (msg) {
         if (msg.info.role === 'assistant') {
           (msg.info as any).time.completed = Date.now();
-          (msg.info as any).tokens = toOpenCodeTokens(this.agentUsage);
+          (msg.info as any).tokens = toOpenCodeTokens(this.turnUsage);
           (msg.info as any).cost = this.agentUsage.cost;
           if (event?.messages) {
             const lastAsst = [...event.messages].reverse().find((m: any) => m?.role === 'assistant');

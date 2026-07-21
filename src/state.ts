@@ -15,6 +15,7 @@ import { getProjectId } from './project.js';
 import { titleFromUserText } from './title-gen.js';
 export { titleFromUserText } from './title-gen.js';
 import { discoverPiSessions, parsePiSessionMessages } from './pi-discovery.js';
+import { addFileDiffMetadata } from './tool-metadata.js';
 
 export interface PendingPermission {
   tool: string;
@@ -219,6 +220,21 @@ export class ServerState {
     );
     const messages = new Map<string, AnyMessageWithParts>();
     for (const msg of data.messages) {
+      if (msg.info.role === 'assistant') {
+        const lastStep = [...msg.parts]
+          .reverse()
+          .find((part): part is Extract<Part, { type: 'step-finish' }> => part.type === 'step-finish');
+        if (lastStep) msg.info.tokens = lastStep.tokens;
+      }
+      for (const part of msg.parts) {
+        if (
+          part.type === 'tool' &&
+          (part.tool === 'edit' || part.tool === 'write') &&
+          part.state.status === 'completed'
+        ) {
+          part.state.metadata = addFileDiffMetadata(part.state.metadata || {}, part.state.input);
+        }
+      }
       messages.set(msg.info.id, msg);
     }
 

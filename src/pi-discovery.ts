@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { titleFromUserText } from './title-gen.js';
+import { addFileDiffMetadata } from './tool-metadata.js';
 
 export interface PiSessionMeta {
   piSessionId: string;
@@ -36,6 +37,15 @@ function toolOutput(content: unknown): string {
 function mapToolName(name: string): string {
   const map: Record<string, string> = { find: 'glob', ls: 'list' };
   return map[name.toLowerCase()] || name;
+}
+
+function convertToolInput(input: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...input,
+    ...(typeof input.path === 'string' && !input.filePath ? { filePath: input.path } : {}),
+    ...(typeof input.old_string === 'string' && !input.oldString ? { oldString: input.old_string } : {}),
+    ...(typeof input.new_string === 'string' && !input.newString ? { newString: input.new_string } : {}),
+  };
 }
 
 const PI_AGENT_DIR = join(homedir(), '.pi', 'agent', 'sessions');
@@ -254,13 +264,14 @@ export async function parsePiSessionMessages(
       const toolPart = toolPartsByCallId.get(msg.toolCallId);
       if (toolPart) {
         const output = toolOutput(msg.content);
+        const metadata = addFileDiffMetadata(msg.details || {}, toolPart.state.input);
         toolPart.state = {
           status: msg.isError ? 'error' : 'completed',
           input: toolPart.state.input,
           ...(msg.isError ? { error: output || 'Tool failed' } : {
             output,
             title: toolPart.tool,
-            metadata: {},
+            metadata,
           }),
           time: { start: toolPart.state.time.start, end: ts },
         };
@@ -299,7 +310,7 @@ export async function parsePiSessionMessages(
             callID,
             state: {
               status: 'completed',
-              input: c.arguments || {},
+              input: convertToolInput(c.arguments || {}),
               output: '',
               title: mapToolName(c.name || 'unknown'),
               metadata: {},
